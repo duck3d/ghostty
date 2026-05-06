@@ -11,7 +11,10 @@ const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
+const configpkg = @import("../../config.zig");
 const session_state = @import("../../session_state.zig");
+const Application = @import("class/application.zig").Application;
+const Config = @import("class/config.zig").Config;
 const Surface = @import("class/surface.zig").Surface;
 const SplitTree = @import("class/split_tree.zig").SplitTree;
 const Tab = @import("class/tab.zig").Tab;
@@ -144,6 +147,227 @@ fn windowSize(window: *Window) struct { width: u32, height: u32 } {
         .width = @intCast(@max(window.as(gtk.Widget).getWidth(), 0)),
         .height = @intCast(@max(window.as(gtk.Widget).getHeight(), 0)),
     };
+}
+
+// ─── Restore ────────────────────────────────────────────────────────────────
+
+/// Attempt to restore session state from disk. Returns true if windows
+/// were restored, false otherwise (caller should create a default window).
+pub fn restoreState(app: anytype) bool {
+    const gpa = app.allocator();
+
+    var arena = ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Load state file
+    const state_path = session_state.statePath(gpa) catch |err| {
+        log.warn("failed to get state path: {}", .{err});
+        return false;
+    };
+    defer gpa.free(state_path);
+
+    const state = (session_state.load(alloc, state_path) catch |err| {
+        log.warn("failed to load session state: {}", .{err});
+        return false;
+    }) orelse return false;
+
+    if (state.windows.len == 0) return false;
+
+    // Load restore commands (optional — daemon may not have written one)
+    const restore_path = session_state.restorePath(gpa) catch |err| {
+        log.warn("failed to get restore path: {}", .{err});
+        return false;
+    };
+    defer gpa.free(restore_path);
+
+    const restore = session_state.loadRestore(alloc, restore_path) catch |err| {
+        log.warn("failed to load restore commands: {}", .{err});
+        null;
+    };
+
+    // Build a lookup: (window_index, tab_index, node_index) → command
+    // For simplicity, we use a flat scan since the list is small.
+
+    var restored_any = false;
+    var focused_surface: ?*Surface = null;
+
+    for (state.windows, 0..) |saved_window, window_index| {
+        if (saved_window.tabs.len == 0) continue;
+
+        const window = Window.new(app, .none);
+
+        if (saved_window.width > 0 and saved_window.height > 0) {
+            window.as(gtk.Window).setDefaultSize(
+                @intCast(saved_window.width),
+                @intCast(saved_window.height),
+            );
+        }
+
+        const selected_tab = @min(saved_window.selected_tab, saved_window.tabs.len - 1);
+
+        for (saved_window.tabs, 0..) |saved_tab, tab_index| {
+            const tab = restoreTab(gpa, alloc, saved_tab, restore, window_index, tab_index) catch |err| {
+                log.warn("failed to restore tab: {}", .{err});
+                continue;
+            } orelse continue;
+
+            // Add tab to window's tab view
+            const tab_view = window.getTabView();
+            const page = tab_view.addPage(tab.tab.as(gtk.Widget), null);
+            if (tab_index == selected_tab) {
+                tab_view.setSelectedPage(page);
+            }
+
+            // Track focused surface
+            if (window_index == (state.active_window orelse 0) and tab_index == selected_tab) {
+                if (tab.focus_surface) |s| focused_surface = s;
+            }
+        }
+
+        if (saved_window.maximized) {
+            window.as(gtk.Window).maximize();
+        }
+        if (saved_window.fullscreen) {
+            window.as(gtk.Window).fullscreen();
+        }
+
+        gtk.Window.present(window.as(gtk.Window));
+        restored_any = true;
+    }
+
+    if (focused_surface) |surface| surface.grabFocus();
+
+    // Delete restore file after consuming (one-shot)
+    if (restore != null) {
+        session_state.deleteRestore(restore_path);
+    }
+
+    log.info("restored session state: {} windows", .{state.windows.len});
+    return restored_any;
+}
+
+const RestoredTab = struct {
+    tab: *Tab,
+    focus_surface: ?*Surface,
+};
+
+fn restoreTab(
+    gpa: Allocator,
+    scratch: Allocator,
+    saved_tab: session_state.TabState,
+    restore: ?session_state.RestoreState,
+    window_index: usize,
+    tab_index: usize,
+) !?RestoredTab {
+    if (saved_tab.nodes.len == 0) return null;
+
+    // Recursively build the Surface.Tree from the saved node array
+    var tree = try buildTree(gpa, scratch, saved_tab.nodes, 0, restore, window_index, tab_index);
+    defer tree.deinit();
+
+    // Create tab and adopt the tree
+    const tab = Tab.new(null, .none);
+    tab.getSplitTree().setTree(&tree);
+
+    // Resolve focused surface
+    const restored_tree = tab.getSplitTree().getTree() orelse return error.InvalidState;
+    const focus_surface: ?*Surface = focus: {
+        const idx = saved_tab.focused_node orelse break :focus null;
+        if (idx >= restored_tree.nodes.len) break :focus null;
+        switch (restored_tree.nodes[idx]) {
+            .leaf => |surface| break :focus surface,
+            .split => break :focus null,
+        }
+    };
+
+    return .{
+        .tab = tab,
+        .focus_surface = focus_surface,
+    };
+}
+
+/// Recursively build a Surface.Tree from the serialized node array.
+fn buildTree(
+    gpa: Allocator,
+    scratch: Allocator,
+    nodes: []const session_state.NodeState,
+    idx: usize,
+    restore: ?session_state.RestoreState,
+    window_index: usize,
+    tab_index: usize,
+) !Surface.Tree {
+    if (idx >= nodes.len) return error.InvalidState;
+
+    return switch (nodes[idx].kind) {
+        .leaf => tree: {
+            // Create a surface with the saved working directory
+            const wd: ?[:0]const u8 = if (nodes[idx].working_directory) |w|
+                try scratch.dupeZ(u8, w)
+            else
+                null;
+
+            const surface = Surface.new(.{
+                .working_directory = wd,
+            });
+            defer surface.unref();
+            _ = surface.refSink();
+
+            // Set pending restore command if available
+            if (restore) |r| {
+                if (findRestoreCommand(r, window_index, tab_index, idx)) |command| {
+                    if (surface.core()) |core| {
+                        core.setRestorePendingCommand(command) catch |err| {
+                            log.warn("failed to set restore command: {}", .{err});
+                        };
+                    }
+                }
+            }
+
+            break :tree try Surface.Tree.init(gpa, surface);
+        },
+
+        .split => tree: {
+            const left_idx = nodes[idx].left orelse return error.InvalidState;
+            const right_idx = nodes[idx].right orelse return error.InvalidState;
+
+            var left = try buildTree(gpa, scratch, nodes, left_idx, restore, window_index, tab_index);
+            defer left.deinit();
+            var right = try buildTree(gpa, scratch, nodes, right_idx, restore, window_index, tab_index);
+            defer right.deinit();
+
+            const direction: Surface.Tree.Split.Direction = switch (nodes[idx].layout orelse return error.InvalidState) {
+                .horizontal => .right,
+                .vertical => .down,
+            };
+
+            break :tree try left.split(
+                gpa,
+                .root,
+                direction,
+                @floatCast(nodes[idx].ratio orelse 0.5),
+                &right,
+            );
+        },
+    };
+}
+
+/// Look up a restore command for a given (window, tab, node) triple.
+fn findRestoreCommand(
+    restore: session_state.RestoreState,
+    window_index: usize,
+    tab_index: usize,
+    node_index: usize,
+) ?[]const u8 {
+    for (restore.commands) |cmd| {
+        if (cmd.window_index == window_index and
+            cmd.tab_index == tab_index and
+            cmd.node_index == node_index)
+        {
+            return cmd.command;
+        }
+    }
+    return null;
 }
 
 /// Save the current session state to disk.

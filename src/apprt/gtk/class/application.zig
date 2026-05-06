@@ -516,6 +516,14 @@ pub const Application = extern struct {
         }
         assert(err_ == null);
 
+        // Attempt to restore saved session state before creating a new window.
+        // If restore succeeds, we skip the default activate (which creates a
+        // blank window).
+        const restored = if (self.windowSaveStateEnabled())
+            session_state_gtk.restoreState(self)
+        else
+            false;
+
         // This just calls the `activate` signal but its part of the normal startup
         // routine so we just call it, but only if the config allows it (this allows
         // for launching Ghostty in the "background" without immediately opening
@@ -527,7 +535,7 @@ pub const Application = extern struct {
             // We need to scope any config access because once we run our
             // event loop, this can change out from underneath us.
             const config = priv.config.get();
-            if (config.@"initial-window") self.as(gio.Application).activate();
+            if (config.@"initial-window" and !restored) self.as(gio.Application).activate();
         }
 
         // If we are NOT the primary instance, then we never want to run.
