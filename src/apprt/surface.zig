@@ -99,6 +99,10 @@ pub const Message = union(enum) {
     /// of the command.
     stop_command: ?u8,
 
+    /// The shell prompt is ready for input. Used to inject pending
+    /// restore commands after session restoration.
+    prompt_ready,
+
     /// The scrollbar state changed for the surface.
     scrollbar: terminal.Scrollbar,
 

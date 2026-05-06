@@ -170,6 +170,14 @@ readonly: bool = false,
 /// the wall clock time that has elapsed between timestamps.
 command_timer: ?std.time.Instant = null,
 
+/// The last command line reported by shell integration, if any.
+/// Used by the session state daemon to resolve restore commands.
+last_command_text: ?[:0]const u8 = null,
+
+/// A pending command to inject once the shell reports that a prompt is ready.
+/// Set during session restore when a restore command is available.
+restore_pending_command: ?[:0]const u8 = null,
+
 /// Search state
 search: ?Search = null,
 
@@ -829,6 +837,9 @@ pub fn deinit(self: *Surface) void {
         self.alloc.destroy(v);
     }
 
+    if (self.last_command_text) |v| self.alloc.free(v);
+    if (self.restore_pending_command) |v| self.alloc.free(v);
+
     // Clean up our keyboard state
     for (self.keyboard.sequence_queued.items) |req| req.deinit();
     self.keyboard.sequence_queued.deinit(self.alloc);
@@ -1135,6 +1146,14 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .start_command => {
             self.command_timer = try .now();
+        },
+
+        .prompt_ready => {
+            // If we have a pending restore command, inject it at the prompt.
+            if (self.restore_pending_command) |pending| {
+                try self.textCallback(pending);
+                try self.setRestorePendingCommand(null);
+            }
         },
 
         .stop_command => |v| timer: {
@@ -2061,6 +2080,34 @@ pub fn pwd(
     defer self.renderer_state.mutex.unlock();
     const terminal_pwd = self.io.terminal.getPwd() orelse return null;
     return try alloc.dupe(u8, terminal_pwd);
+}
+
+/// Returns the last command text captured via shell integration, if any.
+pub fn lastCommandText(self: *const Surface) ?[:0]const u8 {
+    return self.last_command_text;
+}
+
+/// Set the last command text. Copies the value.
+pub fn setLastCommandText(self: *Surface, text: ?[]const u8) Allocator.Error!void {
+    if (self.last_command_text) |v| {
+        self.alloc.free(v);
+        self.last_command_text = null;
+    }
+    if (text) |v| {
+        self.last_command_text = try self.alloc.dupeZ(u8, v);
+    }
+}
+
+/// Set a pending command to inject at the next shell prompt.
+/// Used during session restore.
+pub fn setRestorePendingCommand(self: *Surface, cmd: ?[]const u8) Allocator.Error!void {
+    if (self.restore_pending_command) |v| {
+        self.alloc.free(v);
+        self.restore_pending_command = null;
+    }
+    if (cmd) |v| {
+        self.restore_pending_command = try self.alloc.dupeZ(u8, v);
+    }
 }
 
 /// Resolves a relative file path to an absolute path using the terminal's pwd.

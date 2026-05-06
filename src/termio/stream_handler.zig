@@ -1092,9 +1092,13 @@ pub const StreamHandler = struct {
                 self.surfaceMessageWriter(.{ .stop_command = code });
             },
 
-            // Handled by Terminal, no special handling by us
+            // Prompt is ready for input — notify surface so it can inject
+            // any pending restore command.
             .end_prompt_start_input,
             .end_prompt_start_input_terminate_eol,
+            => self.surfaceMessageWriter(.prompt_ready),
+
+            // Handled by Terminal, no special handling by us
             .fresh_line,
             .fresh_line_new_prompt,
             .new_command,
