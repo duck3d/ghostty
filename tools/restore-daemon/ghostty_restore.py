@@ -392,17 +392,16 @@ def run_once(
     if current == state.last_commands:
         return
 
-    state.last_commands = current
+    # Never overwrite a good restore file with an empty one.
+    # When Ghostty quits, all sessions disappear — but the restore file
+    # from the last good poll is exactly what we need for restore.
+    if not entries:
+        log.debug("No entries found, preserving existing restore file")
+        return
 
-    if entries:
-        write_restore_file(entries, restore_path)
-        log.info("Updated restore file: %d entries", len(entries))
-    else:
-        # No entries — remove stale file
-        try:
-            restore_path.unlink()
-        except FileNotFoundError:
-            pass
+    state.last_commands = current
+    write_restore_file(entries, restore_path)
+    log.info("Updated restore file: %d entries", len(entries))
 
 
 def main() -> None:
