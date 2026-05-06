@@ -42,6 +42,7 @@ const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseCo
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
 const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
 const OpenURI = @import("../portal.zig").OpenURI;
+const session_state_gtk = @import("../session_state_gtk.zig");
 
 const log = std.log.scoped(.gtk_ghostty_application);
 
@@ -637,6 +638,11 @@ pub const Application = extern struct {
     }
 
     fn quitNow(self: *Self) void {
+        // Save session state before destroying windows.
+        if (self.windowSaveStateEnabled()) {
+            session_state_gtk.saveState(self);
+        }
+
         // Get all our windows and destroy them, forcing them to free.
         const list = gtk.Window.listToplevels();
         defer list.free();
@@ -662,6 +668,12 @@ pub const Application = extern struct {
 
         // Trigger our runloop exit.
         self.private().running = false;
+    }
+
+    fn windowSaveStateEnabled(self: *Self) bool {
+        const config_obj = self.getConfig();
+        defer config_obj.unref();
+        return config_obj.get().@"window-save-state" == .always;
     }
 
     /// apprt API to perform an action.
