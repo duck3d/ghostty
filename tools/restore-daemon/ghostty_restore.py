@@ -51,8 +51,42 @@ class RestoreEntry:
 # ─── AppleScript Bridge ─────────────────────────────────────────────────────
 
 
-def enumerate_terminals() -> list[Terminal]:
-    """Use AppleScript to list all Ghostty terminals with metadata."""
+def enumerate_terminals_from_state_file(state_path: Path) -> list[Terminal]:
+    """Read terminals from Ghostty's native session-state.json.
+
+    This is the preferred mode — no AppleScript, no TCC prompts, cross-platform.
+    Ghostty writes this file continuously while running.
+    """
+    if not state_path.exists():
+        return []
+
+    try:
+        data = json.loads(state_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("Failed to read state file: %s", e)
+        return []
+
+    if data.get("version") != 1:
+        return []
+
+    terminals: list[Terminal] = []
+    for window in data.get("windows", []):
+        for tab in window.get("tabs", []):
+            for i, node in enumerate(tab.get("nodes", [])):
+                if node.get("kind") != "leaf":
+                    continue
+                pid = node.get("pid")
+                terminals.append(Terminal(
+                    terminal_id=f"node-{i}",
+                    name=node.get("title_override", ""),
+                    working_directory=node.get("working_directory", ""),
+                    pid=int(pid) if pid else None,
+                ))
+    return terminals
+
+
+def enumerate_terminals_applescript() -> list[Terminal]:
+    """Fallback: use AppleScript to list Ghostty terminals (macOS only)."""
     script = """
     tell application "Ghostty"
         set output to ""
@@ -74,10 +108,10 @@ def enumerate_terminals() -> list[Terminal]:
             timeout=10,
         )
         if result.returncode != 0:
-            log.warning("AppleScript failed: %s", result.stderr.strip())
+            log.debug("AppleScript failed: %s", result.stderr.strip())
             return []
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        log.warning("AppleScript not available")
+        log.debug("AppleScript not available")
         return []
 
     terminals = []
@@ -93,6 +127,17 @@ def enumerate_terminals() -> list[Terminal]:
                 working_directory=parts[2],
             ))
     return terminals
+
+
+def enumerate_terminals(state_path: Path | None = None) -> list[Terminal]:
+    """Enumerate terminals, preferring native state file over AppleScript."""
+    if state_path:
+        terminals = enumerate_terminals_from_state_file(state_path)
+        if terminals:
+            return terminals
+
+    # Fallback to AppleScript
+    return enumerate_terminals_applescript()
 
 
 @dataclass
@@ -366,13 +411,17 @@ def run_once(
     adapters_dir: Path | None,
     restore_path: Path,
     state: DaemonState,
+    state_file_path: Path | None = None,
 ) -> None:
     """Single iteration of the daemon loop."""
-    terminals = enumerate_terminals()
+    terminals = enumerate_terminals(state_path=state_file_path)
     if not terminals:
         return
 
-    resolve_pids(terminals)
+    # If terminals came from the state file, they already have PIDs.
+    # Only run AppleScript-based PID resolution if needed.
+    if not any(t.pid for t in terminals):
+        resolve_pids(terminals)
 
     entries: list[RestoreEntry] = []
     for terminal in terminals:
@@ -419,6 +468,12 @@ def main() -> None:
         help="Directory containing adapter scripts",
     )
     parser.add_argument(
+        "--state-path",
+        type=Path,
+        default=None,
+        help="Path to Ghostty's session-state.json (native mode, no AppleScript)",
+    )
+    parser.add_argument(
         "--restore-path",
         type=Path,
         default=None,
@@ -441,13 +496,18 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    state_home = os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+
+    state_file_path = args.state_path
+    if state_file_path is None:
+        state_file_path = Path(state_home) / "ghostty" / "session-state.json"
+
     restore_path = args.restore_path
     if restore_path is None:
-        # Default: XDG state dir
-        state_home = os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
         restore_path = Path(state_home) / "ghostty" / "session-restore.json"
 
     log.info("Ghostty restore daemon starting")
+    log.info("State file: %s (native mode: %s)", state_file_path, state_file_path.exists())
     log.info("Restore file: %s", restore_path)
     log.info("Adapters dir: %s", args.adapters_dir)
     log.info("Poll interval: %ds", args.interval)
@@ -455,7 +515,7 @@ def main() -> None:
     state = DaemonState()
 
     if args.once:
-        run_once(args.adapters_dir, restore_path, state)
+        run_once(args.adapters_dir, restore_path, state, state_file_path)
         return
 
     # Handle graceful shutdown
@@ -471,7 +531,7 @@ def main() -> None:
 
     while running:
         try:
-            run_once(args.adapters_dir, restore_path, state)
+            run_once(args.adapters_dir, restore_path, state, state_file_path)
         except Exception:
             log.exception("Error in daemon loop")
         time.sleep(args.interval)
