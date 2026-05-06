@@ -104,6 +104,28 @@ class ClaudeSession:
     name: str = ""
 
 
+def _parse_session_json(raw: str) -> dict | None:
+    """Parse a Claude session JSON file, handling corrupted files.
+
+    Claude Code has a bug where `--name` updates can append data after the
+    closing brace, producing invalid JSON like:
+        {"pid":1,"sessionId":"abc"}"name":"foo"}
+    We handle this by using JSONDecoder.raw_decode which stops at the first
+    valid object boundary.
+    """
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        decoder = json.JSONDecoder()
+        data, _ = decoder.raw_decode(raw)
+        return data
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 def get_claude_sessions() -> list[ClaudeSession]:
     """Read all active Claude session files."""
     sessions_dir = Path.home() / ".claude" / "sessions"
@@ -138,7 +160,10 @@ def get_claude_sessions() -> list[ClaudeSession]:
         session_file = sessions_dir / f"{pid}.json"
         if session_file.exists():
             try:
-                data = json.loads(session_file.read_text())
+                raw = session_file.read_text()
+                data = _parse_session_json(raw)
+                if data is None:
+                    continue
                 session_id = data.get("sessionId", "")
                 if session_id:
                     sessions.append(ClaudeSession(
@@ -147,7 +172,7 @@ def get_claude_sessions() -> list[ClaudeSession]:
                         cwd=data.get("cwd", ""),
                         name=data.get("name", ""),
                     ))
-            except (json.JSONDecodeError, OSError):
+            except OSError:
                 continue
 
     return sessions
@@ -223,11 +248,13 @@ def run_builtin_claude_adapter(pid: int) -> AdapterResult | None:
     if not session_file.exists():
         return None
     try:
-        data = json.loads(session_file.read_text())
+        data = _parse_session_json(session_file.read_text())
+        if data is None:
+            return None
         session_id = data.get("sessionId")
         if session_id:
             return AdapterResult(command=f"claude --resume {session_id}")
-    except (json.JSONDecodeError, OSError):
+    except OSError:
         pass
     return None
 
