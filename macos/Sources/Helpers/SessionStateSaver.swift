@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import GhosttyKit
 
 /// Saves session state to a JSON file that the restore daemon can read.
 /// This runs alongside the existing NSWindowRestoration system — it doesn't
@@ -76,7 +77,7 @@ enum SessionStateSaver {
 
         return [
             "focused_node": focusedNode as Any,
-            "zoomed_node": nil as Any,
+            "zoomed_node": NSNull(),
             "nodes": nodes,
         ]
     }
@@ -114,7 +115,8 @@ enum SessionStateSaver {
             }
 
             // Get title
-            if let title = view.title, !title.isEmpty {
+            let title = view.title
+            if !title.isEmpty {
                 leaf["title_override"] = title
             }
 
