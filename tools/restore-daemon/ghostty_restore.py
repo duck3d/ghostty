@@ -95,14 +95,22 @@ def enumerate_terminals() -> list[Terminal]:
     return terminals
 
 
-def resolve_pids(terminals: list[Terminal]) -> None:
-    """Resolve foreground PIDs for terminals by matching TTY devices.
+@dataclass
+class ClaudeSession:
+    """A Claude session resolved from ~/.claude/sessions/."""
+    pid: int
+    session_id: str
+    cwd: str
+    name: str = ""
 
-    Ghostty doesn't expose PIDs via AppleScript, so we correlate by
-    looking at `claude` processes and matching their session names to
-    terminal titles.
-    """
-    # Get all claude processes with their PIDs and TTYs
+
+def get_claude_sessions() -> list[ClaudeSession]:
+    """Read all active Claude session files."""
+    sessions_dir = Path.home() / ".claude" / "sessions"
+    if not sessions_dir.exists():
+        return []
+
+    # Get running Claude PIDs
     try:
         result = subprocess.run(
             ["ps", "-eo", "pid,command"],
@@ -111,37 +119,94 @@ def resolve_pids(terminals: list[Terminal]) -> None:
             timeout=5,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        return
+        return []
 
-    claude_pids: list[int] = []
+    claude_pids: set[int] = set()
     for line in result.stdout.strip().split("\n"):
         parts = line.strip().split(None, 1)
-        if len(parts) == 2 and parts[1].strip() in ("claude", "claude "):
-            try:
-                claude_pids.append(int(parts[0]))
-            except ValueError:
-                continue
+        if len(parts) == 2 and parts[1].strip().startswith("claude"):
+            cmd = parts[1].strip()
+            # Match "claude" or "claude --..." but not "claude-something-else"
+            if cmd == "claude" or cmd.startswith("claude "):
+                try:
+                    claude_pids.add(int(parts[0]))
+                except ValueError:
+                    continue
 
-    # Read Claude session files to build pid → session name mapping
-    sessions_dir = Path.home() / ".claude" / "sessions"
-    pid_to_name: dict[int, str] = {}
+    sessions: list[ClaudeSession] = []
     for pid in claude_pids:
         session_file = sessions_dir / f"{pid}.json"
         if session_file.exists():
             try:
                 data = json.loads(session_file.read_text())
-                name = data.get("name", "")
-                if name:
-                    pid_to_name[pid] = name
+                session_id = data.get("sessionId", "")
+                if session_id:
+                    sessions.append(ClaudeSession(
+                        pid=pid,
+                        session_id=session_id,
+                        cwd=data.get("cwd", ""),
+                        name=data.get("name", ""),
+                    ))
             except (json.JSONDecodeError, OSError):
                 continue
 
-    # Match terminals to PIDs by session name in terminal title
+    return sessions
+
+
+def resolve_pids(terminals: list[Terminal]) -> None:
+    """Resolve foreground PIDs for terminals by correlating Claude sessions.
+
+    Uses a multi-pass strategy:
+    1. Match by session name in terminal title (exact)
+    2. Match by working directory for unnamed sessions
+    """
+    sessions = get_claude_sessions()
+    if not sessions:
+        return
+
+    matched_pids: set[int] = set()
+    matched_terminals: set[str] = set()
+
+    # Pass 1: Match by session name in terminal title (most reliable)
     for terminal in terminals:
-        for pid, name in pid_to_name.items():
-            if name in terminal.name:
-                terminal.pid = pid
+        for session in sessions:
+            if session.pid in matched_pids:
+                continue
+            if session.name and session.name in terminal.name:
+                terminal.pid = session.pid
+                matched_pids.add(session.pid)
+                matched_terminals.add(terminal.terminal_id)
                 break
+
+    # Pass 2: Match remaining sessions by cwd to remaining terminals
+    unmatched_sessions = [s for s in sessions if s.pid not in matched_pids]
+    unmatched_terminals = [t for t in terminals if t.terminal_id not in matched_terminals]
+
+    for session in unmatched_sessions:
+        for terminal in unmatched_terminals:
+            if terminal.terminal_id in matched_terminals:
+                continue
+            # Normalize paths for comparison
+            if (session.cwd and terminal.working_directory and
+                    os.path.realpath(session.cwd) == os.path.realpath(terminal.working_directory)):
+                terminal.pid = session.pid
+                matched_pids.add(session.pid)
+                matched_terminals.add(terminal.terminal_id)
+                break
+
+    # Pass 3: For any still-unmatched sessions, write them directly
+    # as "orphan" entries — we know the session ID even without a
+    # terminal match. These get a synthetic terminal ID.
+    for session in sessions:
+        if session.pid not in matched_pids:
+            # Create a synthetic terminal entry so the restore file
+            # includes ALL sessions, not just matched ones
+            terminals.append(Terminal(
+                terminal_id=f"orphan-{session.pid}",
+                name=session.name or f"claude-{session.pid}",
+                working_directory=session.cwd,
+                pid=session.pid,
+            ))
 
 
 # ─── Adapter System ──────────────────────────────────────────────────────────
